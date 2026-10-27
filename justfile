@@ -7,6 +7,16 @@ default:
 check:
     python3 scripts/check_pagination.py
 
+# pytest + requests_mock unit tests for the factories. No Docker.
+test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x .venv/bin/python ]; then
+        python3 -m venv .venv
+        .venv/bin/pip install -q -e "pagination_pkg[test]"
+    fi
+    .venv/bin/python -m pytest -q tests
+
 # Airflow 3 plus the fake API container
 up:
     astro dev start --no-browser

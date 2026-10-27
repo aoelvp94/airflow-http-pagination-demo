@@ -9,9 +9,9 @@ from typing import Any
 from http_pagination.collect import collect, fetch, records_from_pages, s3_body
 from http_pagination.factories import (
     cursor_pagination,
-    next_url_pagination,
+    next_link_pagination,
     offset_pagination,
-    page_pagination,
+    page_number_pagination,
 )
 
 ORDERS = 7
@@ -31,6 +31,7 @@ def run(base_url: str) -> list[dict[str, Any]]:
         _next_url(base),
         _next_url_foreign_host(base),
         _max_pages(base),
+        _fresh_callback_per_page(base),
         _s3_one_page_versus_all(base),
     ]
     return checks
@@ -78,7 +79,7 @@ def _page(base: str) -> dict[str, Any]:
     pages = collect(
         f"{base}/customers",
         {"page": 1, "page_size": 2},
-        page_pagination(page_size=2, records_key="customers", limit_param="page_size"),
+        page_number_pagination(page_size=2, records_key="customers", limit_param="page_size"),
     )
     ids = _ids(records_from_pages(pages, "customers"))
     ok = ids == list(range(1, CUSTOMERS + 1)) and len(pages) == 3
@@ -130,7 +131,7 @@ def _next_url(base: str) -> dict[str, Any]:
     pages = collect(
         f"{base}/feeds",
         {"limit": 2},
-        next_url_pagination(path="page.next"),
+        next_link_pagination(path="page.next"),
     )
     ids = _ids(records_from_pages(pages, "items"))
     ok = ids == ["f1", "f2", "f3", "f4"] and len(pages) == 2
@@ -145,7 +146,7 @@ def _next_url_foreign_host(base: str) -> dict[str, Any]:
     logger.addHandler(handler)
     logger.setLevel(logging.WARNING)
     try:
-        pages = collect(f"{base}/feeds/trap", {}, next_url_pagination(path="page.next"))
+        pages = collect(f"{base}/feeds/trap", {}, next_link_pagination(path="page.next"))
     finally:
         logger.removeHandler(handler)
     ids = _ids(records_from_pages(pages, "items"))
@@ -162,18 +163,32 @@ def _max_pages(base: str) -> dict[str, Any]:
     pages = collect(
         f"{base}/orders",
         {"offset": 0, "limit": 2},
-        offset_pagination(page_size=2, records_key="orders", has_more_key="has_more", max_pages=2),
+        offset_pagination(page_size=2, records_key="orders", has_more_key="has_more"),
+        max_pages=2,
     )
     ids = _ids(records_from_pages(pages, "orders"))
     ok = len(pages) == 2 and ids == [1, 2, 3, 4]
     return {"name": "max pages", "ok": ok, "detail": f"capped at {len(pages)} pages, ids={ids}"}
 
 
+def _fresh_callback_per_page(base: str) -> dict[str, Any]:
+    """Deferrable mode rebuilds the operator after each defer: a new callback per page."""
+
+    def make() -> Any:
+        return offset_pagination(page_size=3, records_key="orders", has_more_key="has_more")
+
+    pages = collect(f"{base}/orders", {"offset": 0, "limit": 3}, lambda response: make()(response))
+    ids = _ids(records_from_pages(pages, "orders"))
+    ok = ids == list(range(1, ORDERS + 1)) and len(pages) == 3
+    return {"name": "fresh callback", "ok": ok, "detail": f"{len(pages)} pages with a new callback each, ids={ids}"}
+
+
 def _s3_one_page_versus_all(base: str) -> dict[str, Any]:
     one = collect(
         f"{base}/orders",
         {"offset": 0, "limit": 3},
-        offset_pagination(page_size=3, records_key="orders", has_more_key="has_more", max_pages=1),
+        offset_pagination(page_size=3, records_key="orders", has_more_key="has_more"),
+        max_pages=1,
     )
     all_pages = collect(
         f"{base}/orders",

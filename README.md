@@ -15,9 +15,9 @@ in Docker.
 hand-written callback                         factories in this repo
 
 you read the body                             offset_pagination(...)
-you decide the next query                     page_pagination(...)
+you decide the next query                     page_number_pagination(...)
 you remember to stop                          cursor_pagination(..., numeric=True)
-you hope the cursor moves                     next_url_pagination(path="page.next")
+you hope the cursor moves                     next_link_pagination(path="page.next")
 ```
 
 ## What the fake API does
@@ -51,9 +51,10 @@ That needs Python 3.10+ and nothing else. Sample output:
   next url             pass  2 pages, ids=['f1', 'f2', 'f3', 'f4']
   next url other host  pass  stopped after ['t1', 't2'], warned=True
   max pages            pass  capped at 2 pages, ids=[1, 2, 3, 4]
+  fresh callback       pass  3 pages with a new callback each, ids=[1, 2, 3, 4, 5, 6, 7]
   http to s3           pass  one response stores [1, 2, 3]; paginated array stores [1, 2, 3, 4, 5, 6, 7]
 
-all 9 scenarios passed
+all 10 scenarios passed
 ```
 
 The numeric cursor takes more requests than the row count because the fake API
@@ -64,6 +65,29 @@ are the whole listing. The string cursor stops on the page that contains both
 `http to s3` is the storage difference. One response, which is what
 `HttpToS3Operator` uploads today, holds the first page only (`[1, 2, 3]`).
 Walking the pages and uploading one JSON array holds `[1, 2, 3, 4, 5, 6, 7]`.
+
+## Design rules the helpers follow
+
+- **Stateless.** The next page comes only from the response (body plus the
+  query string of `response.url`). In deferrable mode `HttpOperator` is
+  rebuilt after each defer, so a counter on the callback resets and an offset
+  walk repeats page 2 forever. The `fresh callback` scenario checks this.
+- **No cap inside the helper.** `max_pages` belongs to the loop
+  (`collect(max_pages=...)` here, `HttpOperator(max_pages=...)` upstream) so it
+  also bounds hand-written callbacks.
+- **One host.** `next_link_pagination` refuses a link to another host unless
+  `allow_other_hosts=True`. `base_path="/v2"` strips a path the connection
+  already has, so the endpoint is not doubled.
+- **GET listings.** Offset and page are read from the URL query. A cursor in a
+  POST body needs a custom callback.
+
+## Unit tests
+
+```bash
+just test
+```
+
+pytest with `requests_mock`, the fixture the Airflow HTTP provider tests use.
 
 ## The same checks inside Airflow
 
@@ -98,8 +122,13 @@ what a reviewer would read.
 
 ```
 pagination_pkg/     the factories, the request loop, and the assertions
+tests/              pytest + requests_mock unit tests
 fake_api/server.py  the JSON API
 scripts/check_pagination.py
 dags/pagination_demo.py
 docker-compose.override.yml
 ```
+
+## License
+
+Apache License 2.0, the same as Apache Airflow. See `LICENSE`.

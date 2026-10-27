@@ -5,12 +5,17 @@
 ``endpoint`` and ``data``. ``data`` is merged into the next request's query
 parameters. Returning ``None`` stops.
 
-These factories cover the four shapes that show up constantly. Each one is a
-callable class so it can be stored on an operator and imported from a package.
+Every callback here is **stateless**: the next page is derived only from the
+response it is given (its body and the query string of ``response.url``).
+In deferrable mode ``HttpOperator`` is rebuilt after every defer, so any
+counter kept on the callable would reset and the walk would repeat page 2.
 
-The callback is only asked for the *next* page. The first request is whatever
-``endpoint`` and ``data`` you set on the operator. Empty values are never
-written into ``data``: ``?after=`` is how a missing cursor becomes "no filter".
+There is no page cap here on purpose. Capping is the caller's job
+(``collect(max_pages=...)`` in this repo, ``HttpOperator(max_pages=...)``
+upstream), so it also protects hand-written callbacks.
+
+Limitation: the current offset/page is read from the URL query, so these
+helpers target GET listings. A POST body cursor needs a custom callback.
 """
 
 from __future__ import annotations
@@ -22,37 +27,128 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 logger = logging.getLogger(__name__)
 
-PageCallback = Callable[[Any], dict[str, Any] | None]
+PageCallback = Callable[[Any], "dict[str, Any] | None"]
 
 
-def _payload(response: Any) -> Any:
-    return response.json()
+def offset_pagination(
+    *,
+    offset_param: str = "offset",
+    limit_param: str = "limit",
+    page_size: int = 100,
+    records_key: str = "",
+    has_more_key: str = "",
+) -> PageCallback:
+    """Advance ``offset_param`` by ``page_size`` until a short page or ``has_more_key`` is false."""
+
+    def next_page(response: Any) -> dict[str, Any] | None:
+        payload = response.json()
+        records = _records(payload, records_key)
+        if _short_page(payload, records, page_size=page_size, has_more_key=has_more_key):
+            return None
+        current = _int_query(response.url, offset_param, default=0)
+        return {"data": {offset_param: current + page_size, limit_param: page_size}}
+
+    return next_page
+
+
+def page_number_pagination(
+    *,
+    page_param: str = "page",
+    limit_param: str = "page_size",
+    page_size: int = 100,
+    records_key: str = "",
+    has_more_key: str = "",
+    first_page: int = 1,
+) -> PageCallback:
+    """Advance a page number until a short page or ``has_more_key`` is false."""
+
+    def next_page(response: Any) -> dict[str, Any] | None:
+        payload = response.json()
+        records = _records(payload, records_key)
+        if _short_page(payload, records, page_size=page_size, has_more_key=has_more_key):
+            return None
+        current = _int_query(response.url, page_param, default=first_page)
+        return {"data": {page_param: current + 1, limit_param: page_size}}
+
+    return next_page
+
+
+def cursor_pagination(
+    *,
+    param: str,
+    field: str,
+    limit_param: str = "limit",
+    page_size: int = 100,
+    records_key: str = "",
+    has_more_key: str = "",
+    numeric: bool = False,
+) -> PageCallback:
+    """Set ``param`` to the max of ``field`` across the page.
+
+    ``numeric=True`` compares values as integers. Plain string ``max()`` ranks
+    ``"999"`` above ``"1000"`` and the cursor stops moving. Stops when the
+    cursor does not advance, the page is short, or ``has_more_key`` is false.
+    An empty cursor is never sent (``?after=`` often means "no filter").
+    """
+
+    def next_page(response: Any) -> dict[str, Any] | None:
+        payload = response.json()
+        records = _records(payload, records_key)
+        if _short_page(payload, records, page_size=page_size, has_more_key=has_more_key):
+            return None
+        nxt = _max_field(records, field, numeric=numeric)
+        if nxt is None or str(nxt) == "":
+            return None
+        if _query_value(response.url, param) == str(nxt):
+            return None
+        return {"data": {param: nxt, limit_param: page_size}}
+
+    return next_page
+
+
+def next_link_pagination(*, path: str, base_path: str = "", allow_other_hosts: bool = False) -> PageCallback:
+    """Follow a next-page URL stored in the body at a dotted ``path``.
+
+    Returns ``{"endpoint": "<path>?<query>"}`` because ``HttpHook`` joins the
+    endpoint onto the connection's base URL. If that base URL already ends in
+    a path (``https://api.example.com/v2``), pass ``base_path="/v2"`` so it is
+    stripped and not doubled. A link on another host is refused unless
+    ``allow_other_hosts`` is set, so connection credentials stay on one host.
+    """
+    prefix = "/" + base_path.strip("/") if base_path.strip("/") else ""
+
+    def next_page(response: Any) -> dict[str, Any] | None:
+        nxt = _dig(response.json(), path)
+        if not isinstance(nxt, str) or not nxt.strip():
+            return None
+        resolved = urljoin(response.url, nxt.strip())
+        if resolved == response.url:
+            return None
+        target = urlparse(resolved)
+        if target.netloc != urlparse(response.url).netloc and not allow_other_hosts:
+            logger.warning("Ignoring next-page URL on a different host: %s", resolved)
+            return None
+        endpoint = target.path
+        if prefix and (endpoint == prefix or endpoint.startswith(prefix + "/")):
+            endpoint = endpoint[len(prefix) :] or "/"
+        if target.query:
+            endpoint = f"{endpoint}?{target.query}"
+        return {"endpoint": endpoint}
+
+    return next_page
 
 
 def _records(payload: Any, records_key: str) -> list[Any]:
     if records_key:
-        if not isinstance(payload, dict):
-            return []
-        rows = payload.get(records_key, [])
+        rows = payload.get(records_key, []) if isinstance(payload, dict) else []
         return rows if isinstance(rows, list) else []
-    if isinstance(payload, list):
-        return payload
-    return []
+    return payload if isinstance(payload, list) else []
 
 
 def _short_page(payload: Any, records: list[Any], *, page_size: int, has_more_key: str) -> bool:
     if has_more_key and isinstance(payload, dict) and not bool(payload.get(has_more_key, True)):
         return True
     return len(records) < page_size
-
-
-def _drop_empty(data: dict[str, Any]) -> dict[str, Any]:
-    kept: dict[str, Any] = {}
-    for key, value in data.items():
-        if value is None or (isinstance(value, str) and value == ""):
-            continue
-        kept[key] = value
-    return kept
 
 
 def _dig(payload: Any, path: str) -> Any:
@@ -62,170 +158,6 @@ def _dig(payload: Any, path: str) -> Any:
             return None
         node = node[part]
     return node
-
-
-class _Bounded:
-    def __init__(self, max_pages: int) -> None:
-        if max_pages < 1:
-            raise ValueError("max_pages must be at least 1")
-        self.max_pages = max_pages
-        self.responses_seen = 0
-
-    def room_for_another_request(self) -> bool:
-        """True when another request is still inside ``max_pages`` total responses."""
-        self.responses_seen += 1
-        return self.responses_seen < self.max_pages
-
-
-class offset_pagination(_Bounded):
-    """Advance ``offset`` by ``page_size`` until a short page or ``has_more_key`` is false.
-
-    The first request must send the starting offset itself, usually ``0``.
-    """
-
-    def __init__(
-        self,
-        *,
-        offset_param: str = "offset",
-        limit_param: str = "limit",
-        page_size: int = 100,
-        records_key: str = "",
-        has_more_key: str = "",
-        max_pages: int = 500,
-    ) -> None:
-        super().__init__(max_pages)
-        self.offset_param = offset_param
-        self.limit_param = limit_param
-        self.page_size = page_size
-        self.records_key = records_key
-        self.has_more_key = has_more_key
-        self._offset = 0
-
-    def __call__(self, response: Any) -> dict[str, Any] | None:
-        if not self.room_for_another_request():
-            return None
-        payload = _payload(response)
-        records = _records(payload, self.records_key)
-        if _short_page(payload, records, page_size=self.page_size, has_more_key=self.has_more_key):
-            return None
-        self._offset += self.page_size
-        return {"data": _drop_empty({self.offset_param: self._offset, self.limit_param: self.page_size})}
-
-
-class page_pagination(_Bounded):
-    """Advance a 1-based page number until a short page or ``has_more_key`` is false.
-
-    The first request must send ``page=1`` itself.
-    """
-
-    def __init__(
-        self,
-        *,
-        page_param: str = "page",
-        limit_param: str = "page_size",
-        page_size: int = 100,
-        records_key: str = "",
-        has_more_key: str = "",
-        max_pages: int = 500,
-    ) -> None:
-        super().__init__(max_pages)
-        self.page_param = page_param
-        self.limit_param = limit_param
-        self.page_size = page_size
-        self.records_key = records_key
-        self.has_more_key = has_more_key
-        self._page = 1
-
-    def __call__(self, response: Any) -> dict[str, Any] | None:
-        if not self.room_for_another_request():
-            return None
-        payload = _payload(response)
-        records = _records(payload, self.records_key)
-        if _short_page(payload, records, page_size=self.page_size, has_more_key=self.has_more_key):
-            return None
-        self._page += 1
-        return {"data": _drop_empty({self.page_param: self._page, self.limit_param: self.page_size})}
-
-
-class cursor_pagination(_Bounded):
-    """Set ``param`` to the max of ``field`` across the page.
-
-    ``numeric=True`` compares values as integers. Plain string ``max()`` treats
-    ``"999"`` as greater than ``"1000"`` and the cursor stops moving, so the
-    client never asks for the rest of the listing.
-
-    Stops when the cursor does not advance, the page is short, or ``has_more_key``
-    is false. An empty cursor is never sent.
-    """
-
-    def __init__(
-        self,
-        *,
-        param: str,
-        field: str,
-        limit_param: str = "limit",
-        page_size: int = 100,
-        records_key: str = "",
-        has_more_key: str = "",
-        numeric: bool = False,
-        max_pages: int = 500,
-    ) -> None:
-        super().__init__(max_pages)
-        self.param = param
-        self.field = field
-        self.limit_param = limit_param
-        self.page_size = page_size
-        self.records_key = records_key
-        self.has_more_key = has_more_key
-        self.numeric = numeric
-
-    def __call__(self, response: Any) -> dict[str, Any] | None:
-        if not self.room_for_another_request():
-            return None
-        payload = _payload(response)
-        records = _records(payload, self.records_key)
-        if _short_page(payload, records, page_size=self.page_size, has_more_key=self.has_more_key):
-            return None
-        nxt = _max_field(records, self.field, numeric=self.numeric)
-        if nxt is None:
-            return None
-        sent = _query_value(response.url, self.param)
-        if sent is not None and str(nxt) == sent:
-            return None
-        return {"data": _drop_empty({self.param: nxt, self.limit_param: self.page_size})}
-
-
-class next_url_pagination(_Bounded):
-    """Follow a next-page URL stored in the body at a dotted ``path``.
-
-    A short page does not stop the walk. A missing pointer does. The callback
-    returns the path and query only, because ``HttpHook`` joins ``endpoint``
-    onto the connection host. An absolute URL on a different host is ignored
-    so the connection's credentials are not sent there.
-    """
-
-    def __init__(self, *, path: str, max_pages: int = 500) -> None:
-        super().__init__(max_pages)
-        self.path = path
-
-    def __call__(self, response: Any) -> dict[str, Any] | None:
-        if not self.room_for_another_request():
-            return None
-        nxt = _dig(_payload(response), self.path)
-        if not isinstance(nxt, str) or not nxt.strip():
-            return None
-        resolved = urljoin(response.url, nxt.strip())
-        current = urlparse(response.url)
-        target = urlparse(resolved)
-        if target.netloc != current.netloc:
-            logger.warning("Ignoring next-page URL on a different host: %s", resolved)
-            return None
-        if resolved == response.url:
-            return None
-        endpoint = target.path
-        if target.query:
-            endpoint = f"{endpoint}?{target.query}"
-        return {"endpoint": endpoint}
 
 
 def _max_field(records: list[Any], field: str, *, numeric: bool) -> Any:
@@ -240,9 +172,7 @@ def _max_field(records: list[Any], field: str, *, numeric: bool) -> Any:
             except (TypeError, ValueError):
                 continue
         values.append(value)
-    if not values:
-        return None
-    return max(values)
+    return max(values) if values else None
 
 
 def _query_value(url: str, name: str) -> str | None:
@@ -250,3 +180,11 @@ def _query_value(url: str, name: str) -> str | None:
         if key == name:
             return value
     return None
+
+
+def _int_query(url: str, name: str, *, default: int) -> int:
+    raw = _query_value(url, name)
+    try:
+        return int(raw) if raw not in (None, "") else default
+    except ValueError:
+        return default
