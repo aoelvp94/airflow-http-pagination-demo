@@ -3,6 +3,10 @@ name = "http-pagination"
 version = "0.1.0"
 description = "Pagination callbacks for Airflow's HttpOperator, plus a paginated HTTP-to-S3 write."
 requires-python = ">=3.10"
+license = "Apache-2.0"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "requests", "requests-mock"]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -7,9 +7,12 @@ A ``requests.Response`` works too: the loop only needs ``.json()`` and ``.url``.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
+
+logger = logging.getLogger(__name__)
 
 
 class Page:
@@ -39,12 +42,18 @@ def fetch(url: str, params: dict[str, Any] | None = None, *, timeout: float = 10
         return Page(response.geturl(), response.status, response.read())
 
 
-def collect(url: str, params: dict[str, Any], pager: Any, *, timeout: float = 10, hard_cap: int = 50) -> list[Page]:
-    """GET ``url`` and follow ``pager`` until it returns ``None``.
+def collect(
+    url: str, params: dict[str, Any], pager: Any, *, timeout: float = 10, max_pages: int | None = 500
+) -> list[Page]:
+    """GET ``url`` and follow ``pager`` until it returns ``None`` or ``max_pages`` responses.
 
     ``pager`` is an ``HttpOperator`` pagination callback: a dict with ``data``
     and/or ``endpoint``, or ``None`` to stop. Empty query values are dropped.
+    The cap lives here, not in the callback, the same place an
+    ``HttpOperator(max_pages=...)`` would enforce it. ``None`` means no cap.
     """
+    if max_pages is not None and max_pages < 1:
+        raise ValueError("max_pages must be at least 1 or None")
     pages: list[Page] = []
     current_url = url
     current_params = _drop_empty(params)
@@ -52,8 +61,9 @@ def collect(url: str, params: dict[str, Any], pager: Any, *, timeout: float = 10
         page = fetch(current_url, current_params, timeout=timeout)
         page.raise_for_status()
         pages.append(page)
-        if len(pages) > hard_cap:
-            raise RuntimeError(f"stopped after {hard_cap} pages; the pager never returned None")
+        if max_pages is not None and len(pages) >= max_pages:
+            logger.warning("Stopped after max_pages=%d responses", max_pages)
+            return pages
         nxt = pager(page)
         if not nxt:
             return pages
